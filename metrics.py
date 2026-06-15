@@ -57,64 +57,123 @@ def compute_zf_precoder(paths, #PathSolver()
     return rzf_precoder(H_est, alpha)
 
 
-def compute_kpis(paths, #PathSolver()
-                 radio_map, #RadioMap()
-                 scene,
-                 bandwidth=100e6, #100mhz
-                 tx_power_dbm=30, #1W
-                 noise_figure_db=7, #receiver noise
-                 coverage_threshold_dbm=-50, #what is considered covered
-                 r = 0, # which receiver do we want metrics for
-                 t = 0, # which transmitter do we want metrics for
-                 precoding_vector=None # zero-forcing weights for this receiver, shape [num_tx_ant]
-                 ):
-
-    import drjit as dr
+def compute_channel_gain(paths, #PathSolver()
+                          r = 0, # which receiver to compute gain for
+                          t = 0, # which transmitter to compute gain for
+                          precoding_vector=None # zero-forcing weights for this receiver, shape [num_tx_ant]
+                          ):
+    """Effective channel gain g_r for receiver r, shared by compute_kpis (for SNR)
+    and allocate_power_channel_inversion (for per-user power allocation).
+    """
     import numpy as np
-    from sionna.rt.utils import dbm_to_watt, watt_to_dbm
-    from scipy.special import erfc
-
-
 
     a_np = np.array(paths.a)           # [2, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
     a_complex = a_np[0] + 1j * a_np[1] # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
 
     if precoding_vector is None:
-        # --- fixed/uniform excitation: same unit-norm + per-stream power footing as ZF, only the ---
-        # --- precoding direction (ones, unnormalized) differs instead of being ZF-optimized ---
+        # --- fixed/uniform excitation: unit-norm equivalent of "ones" ---
         num_tx_ant = a_complex.shape[3]
         h = np.sum(a_complex[r, :, t, :, :], axis=(-2, -1))  # sum over tx_ant and paths -> scalar per rx_ant
-        g = np.sum(np.abs(h)**2) / num_tx_ant  # normalize for the unit-norm equivalent of "ones"
-        tx_power_w = dbm_to_watt(tx_power_dbm) / len(scene.receivers)  # same per-stream power split as ZF
+        return np.sum(np.abs(h)**2) / num_tx_ant  # normalize for the unit-norm equivalent of "ones"
     else:
         # --- zero-forcing: per-rx-antenna channel projected onto precoding weights, then MRC across rx antennas ---
         H_r = np.sum(a_complex[r, :, t, :, :], axis=-1)  # sum over paths -> [num_rx_ant, num_tx_ant]
         h = H_r @ precoding_vector                       # [num_rx_ant]
-        g = np.sum(np.abs(h)**2)
+        return np.sum(np.abs(h)**2)
+
+
+def allocate_power_channel_inversion(gains, #per-user channel gains g_r, shape [num_rx]
+                                      tx_power_dbm=30 #total transmit power to split across users
+                                      ):
+    """Channel-inversion power allocation: P_r = P_total * (1/g_r) / sum(1/g_j).
+    Gives more power to users with weak channels and less to users with strong
+    channels, equalizing SINR across users (noise power is the same for everyone here).
+    """
+    import numpy as np
+    from sionna.rt.utils import dbm_to_watt
+
+    inv_gains = 1.0 / np.asarray(gains)
+    return dbm_to_watt(tx_power_dbm) * inv_gains / np.sum(inv_gains)  # [num_rx], watts
+
+
+def compute_channel_gain_matrix(paths, #PathSolver()
+                                 t = 0, # which transmitter
+                                 precoding_vectors=None # [num_tx_ant, num_rx] columns = per-user precoding vectors; None = no per-user beams
+                                 ):
+    """Cross-gain matrix G[r, j]: signal power receiver r picks up from the beam
+    intended for user j (MRC-combined over rx antennas). The diagonal G[r, r] is
+    each user's own signal gain (same as compute_channel_gain); off-diagonals
+    G[r, j] for j != r are inter-user interference - ~0 under ideal ZF, non-zero
+    once CSI error makes the nulling imperfect. Needed for true SINR
+    (signal / (noise + interference)).
+
+    With precoding_vectors=None there are no per-user beams (single shared
+    broadcast), so G is diagonal and there is no inter-user interference.
+    """
+    import numpy as np
+
+    a_np = np.array(paths.a)           # [2, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
+    a_complex = a_np[0] + 1j * a_np[1] # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
+
+    if precoding_vectors is None:
+        num_tx_ant = a_complex.shape[3]
+        h = np.sum(a_complex[:, :, t, :, :], axis=(-2, -1))  # sum over tx_ant and paths -> [num_rx, num_rx_ant]
+        gains = np.sum(np.abs(h)**2, axis=-1) / num_tx_ant   # unit-norm equivalent of "ones"
+        return np.diag(gains)
+
+    H = np.sum(a_complex[:, :, t, :, :], axis=-1)              # sum over paths -> [num_rx, num_rx_ant, num_tx_ant]
+    HW = np.einsum('rat,tj->raj', H, precoding_vectors)        # each user j's beam seen by each receiver r
+    return np.sum(np.abs(HW)**2, axis=1)                       # [num_rx, num_rx], MRC over rx antennas
+
+
+def compute_kpis(paths, #PathSolver()
+                 radio_map, #RadioMap()
+                 scene,
+                 bandwidth=100e6, #100mhz
+                 tx_power_dbm=30, #1W, used only if tx_power_w is not given
+                 tx_power_w=None, #per-user tx power in watts, e.g. from allocate_power_channel_inversion; overrides tx_power_dbm
+                 noise_figure_db=7, #receiver noise
+                 coverage_threshold_dbm=-50, #what is considered covered
+                 r = 0, # which receiver do we want metrics for
+                 t = 0, # which transmitter do we want metrics for
+                 precoding_vector=None, # zero-forcing weights for this receiver, shape [num_tx_ant]
+                 g=None, # own-signal channel gain for receiver r; if None, computed from paths/precoding_vector
+                 interference_w=0.0 # power (W) receiver r picks up from OTHER users' beams, e.g. from compute_channel_gain_matrix
+                 ):
+
+    import numpy as np
+    from sionna.rt.utils import dbm_to_watt, watt_to_dbm
+    from scipy.special import erfc
+
+    if g is None:
+        g = compute_channel_gain(paths, r=r, t=t, precoding_vector=precoding_vector)
+
+    if tx_power_w is None:
         tx_power_w = dbm_to_watt(tx_power_dbm) / len(scene.receivers)  # equal power split across users
 
     thermal_noise_w = scene.thermal_noise_power * (bandwidth / scene.bandwidth)
     noise_figure_lin = 10 ** (noise_figure_db / 10)
     noise_power_w = thermal_noise_w * noise_figure_lin
 
-    # SNR
-    snr_linear = (np.squeeze(np.maximum((tx_power_w * g) / noise_power_w, 0)))
-    snr_db = (10 * np.log10(snr_linear))
+    # SINR = own signal / (thermal noise + interference from other users' beams)
+    sinr_linear = (np.squeeze(np.maximum((tx_power_w * g) / (noise_power_w + interference_w), 0)))
+    sinr_db = (10 * np.log10(sinr_linear))
 
     # closed form BER for coherent bpsk over awgn - BER = 1/2 erfc (sqrt(eta))
-    ber = 0.5 * erfc(np.sqrt(snr_linear))
+    ber = 0.5 * erfc(np.sqrt(sinr_linear))
 
     # shannon capacity
-    throughput_mbps = bandwidth * np.log2(1 + snr_linear) / 1e6 #div by 1e6 to get mbps instead of bps
+    throughput_mbps = bandwidth * np.log2(1 + sinr_linear) / 1e6 #div by 1e6 to get mbps instead of bps
 
     rm_values = radio_map.path_gain.numpy()
     coverage_fraction = float(np.mean(rm_values > coverage_threshold_dbm))
 
     return {
-        "snr_db":            snr_db,
+        "sinr_db":           sinr_db,
         "ber":               float(ber),
         "throughput_mbps":   round(float(throughput_mbps), 2),
         "coverage_fraction": round(coverage_fraction, 4),
+        "tx_power_dbm":      round(float(watt_to_dbm(tx_power_w)), 2),
     }
 
 
@@ -135,7 +194,7 @@ def plot_kpis(kpi_log, scene=None):
 
     for name in drone_names:
         color = colors.get(name)
-        axes[0, 0].plot(steps, [step[name]["snr_db"] for step in kpi_log], marker="o", label=name, color=color)
+        axes[0, 0].plot(steps, [step[name]["sinr_db"] for step in kpi_log], marker="o", label=name, color=color)
         axes[0, 1].plot(steps, [step[name]["ber"] for step in kpi_log], marker="o", label=name, color=color)
         axes[1, 0].plot(steps, [step[name]["throughput_mbps"] for step in kpi_log], marker="o", label=name, color=color)
 
@@ -143,7 +202,7 @@ def plot_kpis(kpi_log, scene=None):
     coverage = [next(iter(step.values()))["coverage_fraction"] for step in kpi_log]
     axes[1, 1].plot(steps, coverage, marker="o", color="black")
 
-    axes[0, 0].set_title("SNR (dB)")
+    axes[0, 0].set_title("SINR (dB)")
     axes[0, 1].set_title("BER")
     axes[0, 1].set_yscale("log")
     axes[1, 0].set_title("Throughput (Mbps)")

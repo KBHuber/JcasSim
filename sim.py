@@ -3,9 +3,10 @@ import matplotlib.pyplot as plt
 import mitsuba as mi
 import numpy as np
 import tensorflow as tf
-from metrics import compute_kpis, compute_zf_precoder
+from metrics import compute_kpis, compute_zf_precoder, compute_channel_gain_matrix, allocate_power_channel_inversion
 from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, Camera, \
     PathSolver, RadioMapSolver, subcarrier_frequencies
+from sionna.rt.utils import dbm_to_watt
 
 
 def simulate(rx_path,   # tf.Tensor [N, T, 3]
@@ -15,7 +16,9 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
              render=False,
              beamforming_on=True,
              precoder_alpha=0.0,    # RZF/MMSE regularization (0 = pure ZF)
-             csi_error_std=0.0):    # stddev of simulated CSI estimation error
+             csi_error_std=0.0,     # stddev of simulated CSI estimation error
+             power_allocation=False, # if True, allocate tx power per user via channel inversion (more power to weak users, less to strong) instead of an equal split
+             tx_power_dbm=30):       # total tx power in dBm, split across users per power_allocation
 
     rm_solver = RadioMapSolver()
     p_solver  = PathSolver()
@@ -53,12 +56,29 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
         # [num_tx_ant, num_rx] precoding weights, one column per drone (None if beamforming is off)
         W = compute_zf_precoder(paths, alpha=precoder_alpha, csi_error_std=csi_error_std) if beamforming_on else None
 
+        # --- Cross-gain matrix: G[r, j] = signal power receiver r sees from user j's beam ---
+        # (diagonal = own signal gain; off-diagonal = inter-user interference, ~0 under ideal ZF)
+        num_rx = len(scene.receivers)
+        G = compute_channel_gain_matrix(paths, precoding_vectors=(W if beamforming_on else None))
+        gains = np.diag(G)
+
+        # --- Power allocation across users ---
+        if power_allocation:
+            tx_power_w = allocate_power_channel_inversion(gains, tx_power_dbm=tx_power_dbm)
+        else:
+            tx_power_w = np.full(num_rx, dbm_to_watt(tx_power_dbm) / num_rx)
+
         # --- Metrics ---
         if generate_metrics:
+            # --- Interference each receiver picks up from other users' beams ---
+            received_power = G * tx_power_w[np.newaxis, :]  # [r, j] = P_j * G[r, j]
+            interference_w = received_power.sum(axis=1) - np.diag(received_power)
+
             step_kpis = {}
             for i, (name, rx) in enumerate(scene.receivers.items()):
                 precoding_vector = W[:, i] if beamforming_on else None
-                kpis = compute_kpis(paths, radio_map=rm, r=i, scene=scene, precoding_vector=precoding_vector)
+                kpis = compute_kpis(paths, radio_map=rm, r=i, scene=scene, precoding_vector=precoding_vector,
+                                     tx_power_w=tx_power_w[i], g=gains[i], interference_w=interference_w[i])
                 kpis["position"] = rx.position.numpy().tolist()
                 step_kpis[name] = kpis
             kpi_log.append(step_kpis)
@@ -67,11 +87,12 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
         # --- Render ---
         if render:
             if beamforming_on:
-                # --- per-drone radio map with that drone's ZF beam, combined incoherently ---
-                # each beam carries 1/num_rx of the total tx power (matches compute_kpis), so
-                # the combined RSS is just the mean of the per-beam path gains times tx_power
-                num_rx = W.shape[1]
-                pathgain_sum = None
+                # --- per-drone radio map with that drone's ZF beam, combined by per-user tx power ---
+                # rm.rss = path_gain * tx.power, so weighting each beam's path gain by its
+                # share of total tx power gives the correct combined RSS for independent
+                # per-user data streams (reduces to a 1/num_rx average under equal split)
+                power_weights = tx_power_w / tx_power_w.sum()
+                pathgain_combined = None
                 for i in range(num_rx):
                     precoding_vec = (
                         mi.TensorXf(W[:, i].real.astype(np.float32)),
@@ -88,12 +109,12 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
                         size=[186, 121],
                         cell_size=[2, 2]
                     )
-                    gain = rm_beam.path_gain.numpy()
-                    pathgain_sum = gain if pathgain_sum is None else pathgain_sum + gain
+                    contribution = power_weights[i] * rm_beam.path_gain.numpy()
+                    pathgain_combined = contribution if pathgain_combined is None else pathgain_combined + contribution
 
                 # path_gain has no public setter - _pathgain_map is the tensor it reads from,
                 # overwrite it so rm.rss reflects the combined per-beam coverage at render time
-                rm._pathgain_map = mi.TensorXf((pathgain_sum / num_rx).astype(np.float32))
+                rm._pathgain_map = mi.TensorXf(pathgain_combined.astype(np.float32))
 
             # When beamforming is off, rm already holds the un-precoded radio map.
             # Always pass radio_map; only pass paths when metrics are computed
