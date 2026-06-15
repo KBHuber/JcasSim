@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import mitsuba as mi
 import numpy as np
 import tensorflow as tf
-from metrics import compute_kpis
+from metrics import compute_kpis, compute_zf_precoder
 from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, Camera, \
     PathSolver, RadioMapSolver, subcarrier_frequencies
 
@@ -12,7 +12,10 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
              cameras,
              scene,
              generate_metrics=True,
-             render=False):
+             render=False,
+             beamforming_on=True,
+             precoder_alpha=0.0,    # RZF/MMSE regularization (0 = pure ZF)
+             csi_error_std=0.0):    # stddev of simulated CSI estimation error
 
     rm_solver = RadioMapSolver()
     p_solver  = PathSolver()
@@ -47,11 +50,15 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
             max_num_paths_per_src=10000
         )
 
+        # [num_tx_ant, num_rx] precoding weights, one column per drone (None if beamforming is off)
+        W = compute_zf_precoder(paths, alpha=precoder_alpha, csi_error_std=csi_error_std) if beamforming_on else None
+
         # --- Metrics ---
         if generate_metrics:
             step_kpis = {}
             for i, (name, rx) in enumerate(scene.receivers.items()):
-                kpis = compute_kpis(paths, radio_map=rm, r=i, scene=scene)
+                precoding_vector = W[:, i] if beamforming_on else None
+                kpis = compute_kpis(paths, radio_map=rm, r=i, scene=scene, precoding_vector=precoding_vector)
                 kpis["position"] = rx.position.numpy().tolist()
                 step_kpis[name] = kpis
             kpi_log.append(step_kpis)
@@ -59,6 +66,36 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
 
         # --- Render ---
         if render:
+            if beamforming_on:
+                # --- per-drone radio map with that drone's ZF beam, combined incoherently ---
+                # each beam carries 1/num_rx of the total tx power (matches compute_kpis), so
+                # the combined RSS is just the mean of the per-beam path gains times tx_power
+                num_rx = W.shape[1]
+                pathgain_sum = None
+                for i in range(num_rx):
+                    precoding_vec = (
+                        mi.TensorXf(W[:, i].real.astype(np.float32)),
+                        mi.TensorXf(W[:, i].imag.astype(np.float32))
+                    )
+                    rm_beam = rm_solver(
+                        scene=scene,
+                        precoding_vec=precoding_vec,
+                        samples_per_tx=10**6,
+                        refraction=True,
+                        max_depth=5,
+                        center=[0, 0, 0.5],
+                        orientation=[0, 0, 0],
+                        size=[186, 121],
+                        cell_size=[2, 2]
+                    )
+                    gain = rm_beam.path_gain.numpy()
+                    pathgain_sum = gain if pathgain_sum is None else pathgain_sum + gain
+
+                # path_gain has no public setter - _pathgain_map is the tensor it reads from,
+                # overwrite it so rm.rss reflects the combined per-beam coverage at render time
+                rm._pathgain_map = mi.TensorXf((pathgain_sum / num_rx).astype(np.float32))
+
+            # When beamforming is off, rm already holds the un-precoded radio map.
             # Always pass radio_map; only pass paths when metrics are computed
             # (paths object is always available here regardless of generate_metrics)
             for cam in cameras:
