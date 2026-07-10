@@ -5,19 +5,65 @@ import numpy as np
 import tensorflow as tf
 from metrics import compute_kpis, compute_zf_precoder, compute_channel_gain_matrix, allocate_power_channel_inversion
 from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, Camera, \
-    PathSolver, RadioMapSolver, subcarrier_frequencies
+    PathSolver, RadioMapSolver, subcarrier_frequencies, SceneObject, ITURadioMaterial
 from sionna.rt.utils import dbm_to_watt
 
 
-def simulate(rx_path,   # tf.Tensor [N, T, 3]
+def setup_drone_meshes(scene, drone_radius_m=0.25):
+    """
+    Add one metal sphere SceneObject per drone receiver already in the scene.
+
+    Each sphere acts as a physical body for the drone: Sionna's ray tracer will
+    find reflections off it (multi-path for comms). The sphere is positioned at
+    the receiver's current location and should be moved in sync with the
+    receiver each timestep by updating SceneObject.position.
+
+    Returns
+    -------
+    drone_meshes : dict  {receiver_name: SceneObject}
+    """
+    # One shared material for all drone bodies — thin metal skin
+    mat_name = "_uas_metal"
+    if mat_name not in scene.radio_materials:
+        mat = ITURadioMaterial(name=mat_name, itu_type="metal", thickness=0.002)
+        scene.add(mat)
+    else:
+        mat = scene.radio_materials[mat_name]
+
+    mesh_objs = []
+    drone_meshes = {}
+    for rx_name, rx in scene.receivers.items():
+        obj = SceneObject(fname=rt.scene.sphere, name=f"_mesh_{rx_name}", radio_material=mat)
+        mesh_objs.append(obj)
+        drone_meshes[rx_name] = obj
+
+    # scene.edit() binds each obj to the scene (sets obj.scene); scale/position
+    # setters require self.scene to be set, so they must come after.
+    scene.edit(add=mesh_objs)
+
+    for rx_name, rx in scene.receivers.items():
+        if rx_name in drone_meshes:
+            drone_meshes[rx_name].scaling = drone_radius_m
+            # Offset mesh center upward by one radius so the comms antenna (at the
+            # receiver point) is below the sphere surface — the LOS from the BS
+            # terminates at the receiver, not inside/through the metal body.
+            pos = np.asarray(rx.position, dtype=float).reshape(3)
+            pos[2] += drone_radius_m
+            drone_meshes[rx_name].position = pos.tolist()
+
+    return drone_meshes
+
+
+def simulate(rx_path,            # tf.Tensor [N, T, 3]
              cameras,
              scene,
+             drone_meshes=None,  # dict from setup_drone_meshes(); None → no mesh tracking
              generate_metrics=True,
              render=False,
              beamforming_on=True,
              precoder_alpha=0.0,    # RZF/MMSE regularization (0 = pure ZF)
              csi_error_std=0.0,     # stddev of simulated CSI estimation error
-             power_allocation=False, # if True, allocate tx power per user via channel inversion (more power to weak users, less to strong) instead of an equal split
+             power_allocation=False, # if True, allocate tx power per user via channel inversion
              tx_power_dbm=30):       # total tx power in dBm, split across users per power_allocation
 
     rm_solver = RadioMapSolver()
@@ -26,16 +72,28 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
     num_steps = rx_path.shape[1]  # T dimension
     kpi_log = [] if generate_metrics else None
 
+    drone_names = list(scene.receivers)
+
     for t in range(num_steps):
 
-        # --- Move ALL receivers (drones) to their position at step t ---
-        for i, rx in enumerate(scene.receivers.values()):
-            rx.position = rx_path[i, t, :]  # tf.Tensor slice, shape [3]
+        # --- Move ALL comms receivers (drones) and their mesh bodies ---
+        for i, name in enumerate(drone_names):
+            rx = scene.receivers[name]
+            rx.position = rx_path[i, t, :]          # tf.Tensor slice, shape [3]
+            if drone_meshes is not None and name in drone_meshes:
+                pos = rx.position.numpy().reshape(3).copy().astype(float)
+                radius = float(np.array(drone_meshes[name].scaling).flat[0])
+                pos[2] += radius  # match the z-offset set at init
+                drone_meshes[name].position = pos.tolist()
+                # Velocity lets PathSolver compute correct Doppler for drone mesh echoes.
+                t_next = min(t + 1, int(rx_path.shape[1]) - 1)
+                vel = (rx_path[i, t_next, :] - rx_path[i, t, :]).numpy().astype(float)
+                drone_meshes[name].velocity = vel.tolist()
 
         # --- Solve radio map and paths after repositioning ---
         rm = rm_solver(
             scene=scene,
-            samples_per_tx=20**6,
+            samples_per_tx=int(2e6),
             refraction=True,
             max_depth=5,
             center=[0, 0, 0.5],
@@ -50,16 +108,20 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
             refraction=True,
             los=True,
             diffraction=True,
-            max_num_paths_per_src=10000
+            max_num_paths_per_src=1000
         )
 
+        num_rx = len(drone_names)
+        drone_rx_indices = [list(scene.receivers.keys()).index(n) for n in drone_names]
+
         # [num_tx_ant, num_rx] precoding weights, one column per drone (None if beamforming is off)
-        W = compute_zf_precoder(paths, alpha=precoder_alpha, csi_error_std=csi_error_std) if beamforming_on else None
+        W = compute_zf_precoder(paths, alpha=precoder_alpha, csi_error_std=csi_error_std,
+                                rx_indices=drone_rx_indices) if beamforming_on else None
 
         # --- Cross-gain matrix: G[r, j] = signal power receiver r sees from user j's beam ---
         # (diagonal = own signal gain; off-diagonal = inter-user interference, ~0 under ideal ZF)
-        num_rx = len(scene.receivers)
-        G = compute_channel_gain_matrix(paths, precoding_vectors=(W if beamforming_on else None))
+        G = compute_channel_gain_matrix(paths, precoding_vectors=(W if beamforming_on else None),
+                                        rx_indices=drone_rx_indices)
         gains = np.diag(G)
 
         # --- Power allocation across users ---
@@ -75,9 +137,11 @@ def simulate(rx_path,   # tf.Tensor [N, T, 3]
             interference_w = received_power.sum(axis=1) - np.diag(received_power)
 
             step_kpis = {}
-            for i, (name, rx) in enumerate(scene.receivers.items()):
+            for i, name in enumerate(drone_names):
+                rx = scene.receivers[name]
                 precoding_vector = W[:, i] if beamforming_on else None
-                kpis = compute_kpis(paths, radio_map=rm, r=i, scene=scene, precoding_vector=precoding_vector,
+                kpis = compute_kpis(paths, radio_map=rm, r=drone_rx_indices[i], scene=scene,
+                                     precoding_vector=precoding_vector,
                                      tx_power_w=tx_power_w[i], g=gains[i], interference_w=interference_w[i])
                 kpis["position"] = rx.position.numpy().tolist()
                 step_kpis[name] = kpis

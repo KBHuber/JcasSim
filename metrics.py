@@ -31,14 +31,15 @@ def rzf_precoder(H_est, #estimated per-user channel matrix [num_rx, num_tx_ant]
 def compute_zf_precoder(paths, #PathSolver()
                         t = 0, # which transmitter to compute precoding weights for
                         alpha = 0.0, # passed to rzf_precoder
-                        csi_error_std = 0.0 # passed to estimate_channel
+                        csi_error_std = 0.0, # passed to estimate_channel
+                        rx_indices = None, # subset of receiver indices to include; None = all
                         ):
 
     import numpy as np
 
     a_np = np.array(paths.a)           # [2, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
     a_complex = a_np[0] + 1j * a_np[1] # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
-    num_rx = a_complex.shape[0]
+    rows = rx_indices if rx_indices is not None else list(range(a_complex.shape[0]))
 
     # --- per-user channel vector: sum over rx antennas and paths, keep tx antennas ---
     # this folds in NLOS paths (reflections/diffraction) at whatever angle they
@@ -48,7 +49,7 @@ def compute_zf_precoder(paths, #PathSolver()
     # at the receiver (see compute_kpis), some residual inter-user interference can remain
     H = np.stack([
         np.sum(a_complex[r, :, t, :, :], axis=(0, -1))  # [num_tx_ant]
-        for r in range(num_rx)
+        for r in rows
     ], axis=0)  # [num_rx, num_tx_ant]
 
     # compute_kpis always scores W against this true H, so any gap introduced by
@@ -98,7 +99,8 @@ def allocate_power_channel_inversion(gains, #per-user channel gains g_r, shape [
 
 def compute_channel_gain_matrix(paths, #PathSolver()
                                  t = 0, # which transmitter
-                                 precoding_vectors=None # [num_tx_ant, num_rx] columns = per-user precoding vectors; None = no per-user beams
+                                 precoding_vectors=None, # [num_tx_ant, num_rx] columns = per-user precoding vectors; None = no per-user beams
+                                 rx_indices=None, # subset of receiver indices; None = all
                                  ):
     """Cross-gain matrix G[r, j]: signal power receiver r picks up from the beam
     intended for user j (MRC-combined over rx antennas). The diagonal G[r, r] is
@@ -114,16 +116,17 @@ def compute_channel_gain_matrix(paths, #PathSolver()
 
     a_np = np.array(paths.a)           # [2, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
     a_complex = a_np[0] + 1j * a_np[1] # [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths]
+    rows = rx_indices if rx_indices is not None else list(range(a_complex.shape[0]))
 
     if precoding_vectors is None:
         num_tx_ant = a_complex.shape[3]
-        h = np.sum(a_complex[:, :, t, :, :], axis=(-2, -1))  # sum over tx_ant and paths -> [num_rx, num_rx_ant]
-        gains = np.sum(np.abs(h)**2, axis=-1) / num_tx_ant   # unit-norm equivalent of "ones"
+        h = np.sum(a_complex[np.ix_(rows), :, t, :, :].squeeze(0), axis=(-2, -1))  # [|rows|, num_rx_ant]
+        gains = np.sum(np.abs(h)**2, axis=-1) / num_tx_ant
         return np.diag(gains)
 
-    H = np.sum(a_complex[:, :, t, :, :], axis=-1)              # sum over paths -> [num_rx, num_rx_ant, num_tx_ant]
-    HW = np.einsum('rat,tj->raj', H, precoding_vectors)        # each user j's beam seen by each receiver r
-    return np.sum(np.abs(HW)**2, axis=1)                       # [num_rx, num_rx], MRC over rx antennas
+    H = np.sum(a_complex[np.ix_(rows), :, t, :, :].squeeze(0), axis=-1)  # [|rows|, num_rx_ant, num_tx_ant]
+    HW = np.einsum('rat,tj->raj', H, precoding_vectors)                   # [|rows|, num_rx_ant, num_rx]
+    return np.sum(np.abs(HW)**2, axis=1)                                   # [|rows|, num_rx]
 
 
 def compute_kpis(paths, #PathSolver()
@@ -133,7 +136,7 @@ def compute_kpis(paths, #PathSolver()
                  tx_power_dbm=30, #1W, used only if tx_power_w is not given
                  tx_power_w=None, #per-user tx power in watts, e.g. from allocate_power_channel_inversion; overrides tx_power_dbm
                  noise_figure_db=7, #receiver noise
-                 coverage_threshold_dbm=-50, #what is considered covered
+                 coverage_threshold_dbm=-80, #what is considered covered
                  r = 0, # which receiver do we want metrics for
                  t = 0, # which transmitter do we want metrics for
                  precoding_vector=None, # zero-forcing weights for this receiver, shape [num_tx_ant]
@@ -165,8 +168,9 @@ def compute_kpis(paths, #PathSolver()
     # shannon capacity
     throughput_mbps = bandwidth * np.log2(1 + sinr_linear) / 1e6 #div by 1e6 to get mbps instead of bps
 
-    rm_values = radio_map.path_gain.numpy()
-    coverage_fraction = float(np.mean(rm_values > coverage_threshold_dbm))
+    rm_path_gain = radio_map.path_gain.numpy()
+    rss_dbm = 10 * np.log10(np.maximum(rm_path_gain * tx_power_w, 1e-30) / 1e-3)
+    coverage_fraction = float(np.mean(rss_dbm > coverage_threshold_dbm))
 
     return {
         "sinr_db":           sinr_db,
@@ -203,10 +207,16 @@ def plot_kpis(kpi_log, scene=None):
     axes[1, 1].plot(steps, coverage, marker="o", color="black")
 
     axes[0, 0].set_title("SINR (dB)")
-    axes[0, 1].set_title("BER")
+
+    axes[0, 1].set_title("BER (BPSK)")
     axes[0, 1].set_yscale("log")
+    axes[0, 1].set_ylim(1e-6, 0.6)  # below 1e-6 FEC handles it; 0.6 shows the noise floor
+
     axes[1, 0].set_title("Throughput (Mbps)")
+    axes[1, 0].set_ylim(0, 1000)    # Shannon cap at ~30 dB SINR with 100 MHz BW
+
     axes[1, 1].set_title("Coverage Fraction")
+    axes[1, 1].set_ylim(0, 1)
 
     for ax in axes.flat:
         ax.set_xlabel("Time step")
@@ -232,3 +242,15 @@ def plot_kpis(kpi_log, scene=None):
 # plot kpis
 # ofdm, broadband
 
+# make plots look better, box plots or other stuff
+
+# figure out sionna's waveforms and hermespy waveforms, which to use, the integration between the two, add meshes
+
+# prefix slide with all the settings and stuff
+# should be able to see buildings
+# plot the ground truth vs what is seen
+# directional beam needs to be wider
+# implement ofdm if possible
+# try different waveforms to see the accuracy differences
+
+# key metrics : accuracy, resolution, probability of detection
