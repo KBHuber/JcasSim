@@ -1,39 +1,69 @@
-import sionna.rt as rt
-import matplotlib.pyplot as plt
 import mitsuba as mi
 import numpy as np
 import tensorflow as tf
-from metrics import compute_kpis, compute_zf_precoder, compute_channel_gain_matrix, allocate_power_channel_inversion
-from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, Camera, \
-    PathSolver, RadioMapSolver, subcarrier_frequencies, SceneObject, ITURadioMaterial
-from sionna.rt.utils import dbm_to_watt
+from sionna.rt import SceneObject, ITURadioMaterial
+
+try:
+    import tensorflow_probability as tfp
+except ImportError:
+    # Optional: only build_rx_path()'s non-integer-subdivision branch needs it, which
+    # raises with an install hint rather than failing this import.
+    tfp = None
 
 
-def setup_drone_meshes(scene, drone_radius_m=0.25):
+# Vertical gap between a drone's comms antenna (its Receiver point) and the bottom of
+# its body, as a fraction of the body's half-extent -- the body is a solid metal cube,
+# so one sitting flush on that point occludes the drone's own antenna.
+#
+# A ratio, not a fixed distance, because the clearance that matters is angular: for a
+# cube of half-extent r centred r + c above the antenna, an arrival at elevation theta
+# clears it iff tan(theta) < c/r. At 0.6 that cone is ~31 deg for any radius. Arrivals
+# from below are never blocked; the body sits entirely above the antenna.
+DRONE_ANTENNA_CLEARANCE_RATIO = 0.6
+
+
+def drone_mesh_z_offset(drone_radius_m, antenna_clearance_m=None):
+    """Height of a drone body's centre above its Receiver point, so the body's
+    underside clears the antenna. ``antenna_clearance_m=None`` scales the gap with the
+    body via DRONE_ANTENNA_CLEARANCE_RATIO, keeping the unoccluded arrival cone
+    constant as the body grows; pass a number to override. A caller that moves a drone
+    applies the same lift setup_drone_meshes() used at init.
     """
-    Add one metal sphere SceneObject per drone receiver already in the scene.
+    if antenna_clearance_m is None:
+        antenna_clearance_m = DRONE_ANTENNA_CLEARANCE_RATIO * drone_radius_m
+    return drone_radius_m + antenna_clearance_m
 
-    Each sphere acts as a physical body for the drone: Sionna's ray tracer will
-    find reflections off it (multi-path for comms). The sphere is positioned at
-    the receiver's current location and should be moved in sync with the
-    receiver each timestep by updating SceneObject.position.
+
+def setup_drone_meshes(scene, drone_radius_m=0.5, scattering_coefficient=0.5,
+                        antenna_clearance_m=None):
+    """
+    Add one metal cube SceneObject per drone receiver already in the scene.
+
+    Each cube is the drone's one physical body, shared by both solves that run
+    against this scene: the ray tracer finds comms multipath off it, and the
+    monostatic radar finds backscatter off the same object.
+
+    The body is Mitsuba's unit cube, [-1,1]^3, so `scaling=drone_radius_m` gives a
+    half-extent of drone_radius_m -- the 0.5 default is a 1 m cube, a Matrice-class
+    UAS. Its flat bottom face is why the clearance above exists.
 
     Returns
     -------
     drone_meshes : dict  {receiver_name: SceneObject}
     """
-    # One shared material for all drone bodies — thin metal skin
+    # one shared material for all drone bodies, a thin metal skin
     mat_name = "_uas_metal"
     if mat_name not in scene.radio_materials:
-        mat = ITURadioMaterial(name=mat_name, itu_type="metal", thickness=0.002)
+        mat = ITURadioMaterial(name=mat_name, itu_type="metal", thickness=0.002,
+                                scattering_coefficient=scattering_coefficient)
         scene.add(mat)
     else:
         mat = scene.radio_materials[mat_name]
 
     mesh_objs = []
     drone_meshes = {}
-    for rx_name, rx in scene.receivers.items():
-        obj = SceneObject(fname=rt.scene.sphere, name=f"_mesh_{rx_name}", radio_material=mat)
+    for rx_name in scene.receivers:
+        obj = SceneObject(mi_mesh=mi.load_dict({"type": "cube"}), name=f"_mesh_{rx_name}", radio_material=mat)
         mesh_objs.append(obj)
         drone_meshes[rx_name] = obj
 
@@ -41,165 +71,17 @@ def setup_drone_meshes(scene, drone_radius_m=0.25):
     # setters require self.scene to be set, so they must come after.
     scene.edit(add=mesh_objs)
 
+    z_offset = drone_mesh_z_offset(drone_radius_m, antenna_clearance_m)
     for rx_name, rx in scene.receivers.items():
         if rx_name in drone_meshes:
             drone_meshes[rx_name].scaling = drone_radius_m
-            # Offset mesh center upward by one radius so the comms antenna (at the
-            # receiver point) is below the sphere surface — the LOS from the BS
-            # terminates at the receiver, not inside/through the metal body.
+            # lift the body so its underside clears the antenna
             pos = np.asarray(rx.position, dtype=float).reshape(3)
-            pos[2] += drone_radius_m
+            pos[2] += z_offset
             drone_meshes[rx_name].position = pos.tolist()
 
     return drone_meshes
 
-
-def simulate(rx_path,            # tf.Tensor [N, T, 3]
-             cameras,
-             scene,
-             drone_meshes=None,  # dict from setup_drone_meshes(); None → no mesh tracking
-             generate_metrics=True,
-             render=False,
-             beamforming_on=True,
-             precoder_alpha=0.0,    # RZF/MMSE regularization (0 = pure ZF)
-             csi_error_std=0.0,     # stddev of simulated CSI estimation error
-             power_allocation=False, # if True, allocate tx power per user via channel inversion
-             tx_power_dbm=30):       # total tx power in dBm, split across users per power_allocation
-
-    rm_solver = RadioMapSolver()
-    p_solver  = PathSolver()
-
-    num_steps = rx_path.shape[1]  # T dimension
-    kpi_log = [] if generate_metrics else None
-
-    drone_names = list(scene.receivers)
-
-    for t in range(num_steps):
-
-        # --- Move ALL comms receivers (drones) and their mesh bodies ---
-        for i, name in enumerate(drone_names):
-            rx = scene.receivers[name]
-            rx.position = rx_path[i, t, :]          # tf.Tensor slice, shape [3]
-            if drone_meshes is not None and name in drone_meshes:
-                pos = rx.position.numpy().reshape(3).copy().astype(float)
-                radius = float(np.array(drone_meshes[name].scaling).flat[0])
-                pos[2] += radius  # match the z-offset set at init
-                drone_meshes[name].position = pos.tolist()
-                # Velocity lets PathSolver compute correct Doppler for drone mesh echoes.
-                t_next = min(t + 1, int(rx_path.shape[1]) - 1)
-                vel = (rx_path[i, t_next, :] - rx_path[i, t, :]).numpy().astype(float)
-                drone_meshes[name].velocity = vel.tolist()
-
-        # --- Solve radio map and paths after repositioning ---
-        rm = rm_solver(
-            scene=scene,
-            samples_per_tx=int(2e6),
-            refraction=True,
-            max_depth=5,
-            center=[0, 0, 0.5],
-            orientation=[0, 0, 0],
-            size=[186, 121],
-            cell_size=[2, 2]
-        )
-
-        paths = p_solver(
-            scene=scene,
-            max_depth=5,
-            refraction=True,
-            los=True,
-            diffraction=True,
-            max_num_paths_per_src=1000
-        )
-
-        num_rx = len(drone_names)
-        drone_rx_indices = [list(scene.receivers.keys()).index(n) for n in drone_names]
-
-        # [num_tx_ant, num_rx] precoding weights, one column per drone (None if beamforming is off)
-        W = compute_zf_precoder(paths, alpha=precoder_alpha, csi_error_std=csi_error_std,
-                                rx_indices=drone_rx_indices) if beamforming_on else None
-
-        # --- Cross-gain matrix: G[r, j] = signal power receiver r sees from user j's beam ---
-        # (diagonal = own signal gain; off-diagonal = inter-user interference, ~0 under ideal ZF)
-        G = compute_channel_gain_matrix(paths, precoding_vectors=(W if beamforming_on else None),
-                                        rx_indices=drone_rx_indices)
-        gains = np.diag(G)
-
-        # --- Power allocation across users ---
-        if power_allocation:
-            tx_power_w = allocate_power_channel_inversion(gains, tx_power_dbm=tx_power_dbm)
-        else:
-            tx_power_w = np.full(num_rx, dbm_to_watt(tx_power_dbm) / num_rx)
-
-        # --- Metrics ---
-        if generate_metrics:
-            # --- Interference each receiver picks up from other users' beams ---
-            received_power = G * tx_power_w[np.newaxis, :]  # [r, j] = P_j * G[r, j]
-            interference_w = received_power.sum(axis=1) - np.diag(received_power)
-
-            step_kpis = {}
-            for i, name in enumerate(drone_names):
-                rx = scene.receivers[name]
-                precoding_vector = W[:, i] if beamforming_on else None
-                kpis = compute_kpis(paths, radio_map=rm, r=drone_rx_indices[i], scene=scene,
-                                     precoding_vector=precoding_vector,
-                                     tx_power_w=tx_power_w[i], g=gains[i], interference_w=interference_w[i])
-                kpis["position"] = rx.position.numpy().tolist()
-                step_kpis[name] = kpis
-            kpi_log.append(step_kpis)
-            print(f"Step {t}: {step_kpis}")
-
-        # --- Render ---
-        if render:
-            if beamforming_on:
-                # --- per-drone radio map with that drone's ZF beam, combined by per-user tx power ---
-                # rm.rss = path_gain * tx.power, so weighting each beam's path gain by its
-                # share of total tx power gives the correct combined RSS for independent
-                # per-user data streams (reduces to a 1/num_rx average under equal split)
-                power_weights = tx_power_w / tx_power_w.sum()
-                pathgain_combined = None
-                for i in range(num_rx):
-                    precoding_vec = (
-                        mi.TensorXf(W[:, i].real.astype(np.float32)),
-                        mi.TensorXf(W[:, i].imag.astype(np.float32))
-                    )
-                    rm_beam = rm_solver(
-                        scene=scene,
-                        precoding_vec=precoding_vec,
-                        samples_per_tx=10**6,
-                        refraction=True,
-                        max_depth=5,
-                        center=[0, 0, 0.5],
-                        orientation=[0, 0, 0],
-                        size=[186, 121],
-                        cell_size=[2, 2]
-                    )
-                    contribution = power_weights[i] * rm_beam.path_gain.numpy()
-                    pathgain_combined = contribution if pathgain_combined is None else pathgain_combined + contribution
-
-                # path_gain has no public setter - _pathgain_map is the tensor it reads from,
-                # overwrite it so rm.rss reflects the combined per-beam coverage at render time
-                rm._pathgain_map = mi.TensorXf(pathgain_combined.astype(np.float32))
-
-            # When beamforming is off, rm already holds the un-precoded radio map.
-            # Always pass radio_map; only pass paths when metrics are computed
-            # (paths object is always available here regardless of generate_metrics)
-            for cam in cameras:
-                scene.render(
-                    camera=cameras[cam],
-                    paths=paths,
-                    radio_map=rm,
-                    num_samples=512,
-                    rm_show_color_bar=True,
-                    rm_vmax=-40,
-                    rm_vmin=-150,
-                    rm_metric="rss"
-                )
-
-    return kpi_log
-
-
-# written by claude sonnet 4.6 low
-# I didn't want to do this by hand but I havent been able to break it so probably right
 def build_rx_path(
     start_points: tf.Tensor,
     base_velocities: tf.Tensor,
@@ -212,20 +94,20 @@ def build_rx_path(
     Subdivide or resample drone velocity segments into a higher-resolution path.
 
     Args:
-        start_points:    Starting positions, shape [N, 3].
-        base_velocities: Coarse velocity segments, shape [N, T, 3].
-        num_steps:       Number of fine-grained steps to produce.
-        dt:              Timestep for the fine-grained path.
-        base_dt:         Timestep that the base_velocities were defined at.
-        on_mismatch:     What to do if num_steps * dt != total trajectory time.
-                         One of "error", "warn", or "snap".
+      start_points:    Starting positions, shape [N, 3].
+      base_velocities: Coarse velocity segments, shape [N, T, 3].
+      num_steps:       Number of fine-grained steps to produce.
+      dt:              Timestep for the fine-grained path.
+      base_dt:         Timestep that the base_velocities were defined at.
+      on_mismatch:     What to do if num_steps * dt != total trajectory time.
+                       One of "error", "warn", or "snap".
 
     Returns:
-        rx_path: Shape [N, num_steps + 1, 3], including the start point.
+      rx_path: Shape [N, num_steps + 1, 3], including the start point.
 
     Raises:
-        ValueError: If on_mismatch="error" and num_steps * dt != total time.
-        ValueError: If on_mismatch is not one of "error", "warn", "snap".
+      ValueError: If on_mismatch="error" and num_steps * dt != total time.
+      ValueError: If on_mismatch is not one of "error", "warn", "snap".
     """
     base_steps = base_velocities.shape[1]  # reads T from [N, T, 3]
     total_time = base_dt * base_steps
@@ -256,16 +138,13 @@ def build_rx_path(
         velocities = tf.repeat(base_velocities, repeats=subdivisions, axis=1)
     else:
         # Resample via linear interpolation along the time axis
-        try:
-            import tensorflow_probability as tfp
-        except ImportError:
+        if tfp is None:
             raise ImportError(
                 "tensorflow_probability is required for non-integer subdivisions. "
                 "Install it with: pip install tensorflow-probability"
             )
 
-        base_t = tf.linspace(0.0, 1.0, base_steps)
-        new_t  = tf.linspace(0.0, 1.0, num_steps)
+        new_t = tf.linspace(0.0, 1.0, num_steps)
         num_drones = base_velocities.shape[0]
 
         velocities = tf.stack([
