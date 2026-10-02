@@ -35,6 +35,14 @@ WHAT'S SIMPLIFIED
 - Equalizer channel knowledge comes from the ray-traced paths (optionally
   corrupted by csi_error_std), not from OFDM pilot symbols.
 
+MULTISTATIC
+-----------
+``bs_position`` may be ``[n, 3]``: the first row is the transmitter, the rest are
+receive-only sensing receivers. Each receiver gets its own solve, run one after
+another so peak memory stays that of a monostatic drop; comms uses the first solve.
+A cube's range and velocity axes are then half the bistatic range sum and half its
+rate, which are range and radial velocity when the receiver is co-located.
+
     drop = run_jcas_drop(scene, bs_position=[-100,0,20],
                           look_at=[-40,5,12], rx_names=["d0", "d1"])
     drop.radar_cube                     # RadarCube, as from sense_snapshot()
@@ -43,6 +51,8 @@ WHAT'S SIMPLIFIED
 """
 
 from __future__ import annotations
+
+import gc
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -89,11 +99,12 @@ class CommsResult:
 
 
 class JCASDropResult:
-    """The two outputs of one JCAS drop: the monostatic RadarCube (which sees every
-    served drone's stream as illumination) and each drone's decoded comms link."""
+    """The two outputs of one JCAS drop: a RadarCube per sensing receiver (each sees
+    every served drone's stream as illumination) and each drone's decoded comms link."""
 
-    def __init__(self, radar_cube, comms):
-        self.radar_cube = radar_cube
+    def __init__(self, radar_cubes, comms):
+        self.radar_cubes = radar_cubes   # list[RadarCube], in receiver order
+        self.radar_cube = radar_cubes[0]
         self.comms = comms   # dict[str, CommsResult], keyed by drone name
 
 
@@ -109,7 +120,8 @@ def _add_thermal_noise(received, noise_w):
 def run_jcas_drop(
     scene,                        # scene already containing every served drone Receiver
                                    # (+ mesh, if radar should see it as a target)
-    bs_position,                  # [3] BS position, world-frame meters
+    bs_position,                  # [3] BS position, world-frame meters (monostatic), or
+                                   # [n, 3]: transmitter, then n-1 sensing receivers
     look_at,                      # [3] BS array boresight, radar and transmit alike
     rx_names,                     # drone Receiver names in `scene` to serve; rx_names[0]
                                    # doubles as the radar's Sturm & Wiesbeck reference frame
@@ -133,14 +145,20 @@ def run_jcas_drop(
     angular_oversample=3,
     max_range_m=None,             # trim the radar cube's range axis to the instrumented
                                    # range; see sensing._ofdm_radar_cube_from_received
+    rx_look_at=None,              # [3] or [n-1, 3] sensing receiver boresight; None -> look_at
     seed=41,
 ) -> JCASDropResult:
-    """Solve once, transmit once per served drone (summed onto one composite array
-    excitation), propagate once per receiver; returns a radar cube and a decoded
-    comms link per drone. See the module docstring for what is simplified.
+    """Solve once per sensing receiver, transmit once per served drone (summed onto one
+    composite array excitation), propagate once per receiver; returns a radar cube per
+    sensing receiver and a decoded comms link per drone. See the module docstring for
+    what is simplified.
     """
 
-    bs_position = np.asarray(bs_position, dtype=float)
+    positions = np.atleast_2d(np.asarray(bs_position, dtype=float))
+    bs_position = positions[0]
+    rx_positions = positions[1:] if len(positions) > 1 else positions
+    rx_look_ats = np.broadcast_to(np.asarray(look_at if rx_look_at is None else rx_look_at, dtype=float),
+                                  rx_positions.shape)
     carrier_frequency = ofdm_config.CARRIER_FREQUENCY
     bandwidth = ofdm_config.BANDWIDTH
     wavelength = speed_of_light / carrier_frequency
@@ -151,23 +169,27 @@ def run_jcas_drop(
     # sense_snapshot()'s scene, this one is shared with the comms drones.
     if "bs_tx" in scene.transmitters:
         del scene._transmitters["bs_tx"]
-    if "bs_rx" in scene.receivers:
-        del scene._receivers["bs_rx"]
     bs_tx = rt.Transmitter("bs_tx", bs_position.tolist())
-    bs_rx = rt.Receiver("bs_rx", bs_position.tolist())
     scene.add(bs_tx)
-    scene.add(bs_rx)
     bs_tx.look_at(look_at)
-    bs_rx.look_at(look_at)
 
-    # One channel: channel.realize() runs the single PathSolver solve covering the
-    # monostatic radar link and every drone's comms link. Each link below is then a
-    # cheap realization.sample() against that cached solve, not a fresh trace.
-    channel = GeometricSionnaChannel(
-        scene, gain=tx_power_w, seed=seed, max_depth=3, max_num_paths_per_src=max_num_paths_per_src,
-        monostatic_min_range_m=3.0, samples_per_src=samples_per_src,
-    )
-    realization = channel.realize()
+    def solve(rx_index):
+        """Swap sensing receiver rx_index in as bs_rx and solve. Returns (bs_rx, realization)."""
+        if "bs_rx" in scene.receivers:
+            del scene._receivers["bs_rx"]
+        bs_rx = rt.Receiver("bs_rx", rx_positions[rx_index].tolist())
+        scene.add(bs_rx)
+        bs_rx.look_at(rx_look_ats[rx_index])
+        channel = GeometricSionnaChannel(
+            scene, gain=tx_power_w, seed=seed, max_depth=3, max_num_paths_per_src=max_num_paths_per_src,
+            monostatic_min_range_m=3.0, samples_per_src=samples_per_src, sensing_rx_names=["bs_rx"],
+        )
+        return bs_rx, channel.realize()
+
+    # channel.realize() runs the single PathSolver solve covering the first sensing
+    # link and every drone's comms link. Each link below is then a cheap
+    # realization.sample() against that cached solve, not a fresh trace.
+    bs_rx, realization = solve(0)
     paths = realization.paths
 
     scene_rx_names = list(scene.receivers.keys())
@@ -178,23 +200,23 @@ def run_jcas_drop(
         # given several rx_indices, so this is jointly nulled, not N single-user precoders.
         precoding_vectors = compute_zf_precoder(paths, rx_indices=drone_indices)   # [64, N]
 
-    # BS array geometry, for the radar operator and the beamform scan. rx_array =
+    # Array geometry, for the radar operator and the beamform scan. rx_array =
     # tx_array, so every receiver in the scene shares it.
     rx_pos_local = np.array(scene.rx_array.positions(wavelength)).T  # [rx_ant, 3]
-    R_bs_rx = np.array(rotation_matrix(bs_rx.orientation))[:, :, 0]
-    rx_pos_world_bs = rx_pos_local @ R_bs_rx.T
+    R_bs_tx = np.array(rotation_matrix(bs_tx.orientation))[:, :, 0]
+    tx_pos_world_bs = rx_pos_local @ R_bs_tx.T
 
     # One independent OFDM frame per served drone, generated via radar.transmit() as
     # sense_snapshot() does, so it is exactly the frame Sturm & Wiesbeck normalization
-    # expects. rx_names[0]'s (radar, device_state) is kept for the estimate below; the
-    # others exist only for their one .transmit() call.
-    radar_device, radar, device_state = _build_ofdm_radar(rx_pos_world_bs, bs_position, carrier_frequency, bandwidth)
+    # expects. rx_names[0]'s radar is kept for the estimate below; the others exist
+    # only for their one .transmit() call.
+    radar_device, radar, device_state = _build_ofdm_radar(tx_pos_world_bs, bs_position, carrier_frequency, bandwidth)
     tx_transmission = radar.transmit(device_state)
     waveform = radar.waveform
     tx_iqs = [tx_transmission.signal.view(np.ndarray)[0]]
     tx_bits_list = [radar._OFDMRadar__last_transmission.bits]
     for _ in rx_names[1:]:
-        _, extra_radar, extra_device_state = _build_ofdm_radar(rx_pos_world_bs, bs_position, carrier_frequency, bandwidth)
+        _, extra_radar, extra_device_state = _build_ofdm_radar(tx_pos_world_bs, bs_position, carrier_frequency, bandwidth)
         extra_transmission = extra_radar.transmit(extra_device_state)
         tx_iqs.append(extra_transmission.signal.view(np.ndarray)[0])
         tx_bits_list.append(extra_radar._OFDMRadar__last_transmission.bits)
@@ -224,29 +246,12 @@ def run_jcas_drop(
             pose=Transformation.From_Translation(drone_positions[name]),
         )
 
-    # N+1 links off one cached solve: realization.sample() matches each device's position
-    # back to its Sionna tx/rx and applies the monostatic self-coupling guard only to the
-    # bs_tx<-bs_rx link. Only the radar link is materialized here; drone links are sampled
-    # one at a time in the COMMS loop and dropped after use, since each costs ~775 MB and
-    # the Monte Carlo grid reaches ~126 drones.
-    sample_radar = realization.sample(radar_device, radar_device, 0.0, carrier_frequency, bandwidth)
-
     tx_signal_model = Signal.Create(tx_signal, sampling_rate=bandwidth, carrier_frequency=carrier_frequency)
-    received_radar = np.asarray(sample_radar.propagate(tx_signal_model).view(np.ndarray))
 
     # Thermal noise, physically scaled (received carries Watts-scale amplitude); applied
     # identically to the drone links as they are streamed in below.
     kTB = 1.38e-23 * 290 * bandwidth
     noise_w = kTB * 10 ** (noise_figure_db / 10)
-
-    # A monostatic link can legitimately return zero paths -- nothing sent energy straight
-    # back to the co-located tx/rx -- and HermesPy then hands back an empty Signal the
-    # Sturm & Wiesbeck estimator cannot consume. Substitute a zero receive buffer so noise
-    # is added as on any other link and the radar sees a noise-only cube.
-    if received_radar.shape[1] == 0:
-        num_radar_rx_ant = rx_pos_world_bs.shape[0]
-        received_radar = np.zeros((num_radar_rx_ant, tx_signal.shape[1]), dtype=complex)
-    _add_thermal_noise(received_radar, noise_w)
 
     # RX aperture taper (Hamming over both array axes), applied per element before the
     # scan and after the noise, so the taper weights it as real hardware would. Drops the
@@ -255,7 +260,6 @@ def run_jcas_drop(
     # without perturbing its nulls. Identical to sense_snapshot()'s taper.
     rx_taper = _hamming_axis(rx_pos_local[:, 1]) * _hamming_axis(rx_pos_local[:, 2])
     rx_taper *= len(rx_taper) / rx_taper.sum()  # sum(w) = N: preserve boresight gain
-    received_radar *= rx_taper[:, np.newaxis]
 
     # ==================== RADAR ====================
     az_hpbw_deg, ze_hpbw_deg = _array_beamwidth_deg(rx_pos_local, wavelength)
@@ -273,19 +277,45 @@ def run_jcas_drop(
         np.sin(angle_grid[:, 1]) * np.sin(angle_grid[:, 0]),
         np.cos(angle_grid[:, 1]),
     ], axis=-1)
-    directions_local = directions_world @ R_bs_rx
-    theta_local = np.arccos(np.clip(directions_local[:, 2], -1.0, 1.0))
-    phi_local = np.arctan2(directions_local[:, 1], directions_local[:, 0])
-    c_theta, c_phi = scene.rx_array.antenna_pattern.patterns[0](mi.Float(theta_local), mi.Float(phi_local))
-    element_gain = np.array(dr.abs(c_theta) ** 2 + dr.abs(c_phi) ** 2)
 
-    # radar.transmit() above already generated rx_names[0]'s frame, so
-    # __last_transmission is set for Sturm normalization; the other drones' streams are
-    # additive self-interference in received_radar (see module docstring).
-    radar_cube = _ofdm_radar_cube_from_received(
-        radar, device_state.receive_state(), received_radar, angle_grid, element_gain, bandwidth, carrier_frequency,
-        max_range_m=max_range_m,
-    )
+    def sense(realization, bs_rx, rx_position):
+        """RadarCube for the bs_tx -> bs_rx link of `realization`."""
+        R_bs_rx = np.array(rotation_matrix(bs_rx.orientation))[:, :, 0]
+        rx_pos_world_bs = rx_pos_local @ R_bs_rx.T
+        rx_device, _, rx_device_state = _build_ofdm_radar(rx_pos_world_bs, rx_position, carrier_frequency, bandwidth)
+
+        # realization.sample() matches each device's position back to its Sionna tx/rx.
+        # Only the radar link is materialized here; drone links are sampled one at a time
+        # in the COMMS loop and dropped after use, since each costs ~775 MB and the Monte
+        # Carlo grid reaches ~126 drones.
+        sample_radar = realization.sample(radar_device, rx_device, 0.0, carrier_frequency, bandwidth)
+        received_radar = np.asarray(sample_radar.propagate(tx_signal_model).view(np.ndarray))
+
+        # A sensing link can legitimately return zero paths -- nothing sent energy back to
+        # the receiver -- and HermesPy then hands back an empty Signal the Sturm & Wiesbeck
+        # estimator cannot consume. Substitute a zero receive buffer so noise is added as
+        # on any other link and the radar sees a noise-only cube.
+        if received_radar.shape[1] == 0:
+            num_radar_rx_ant = rx_pos_world_bs.shape[0]
+            received_radar = np.zeros((num_radar_rx_ant, tx_signal.shape[1]), dtype=complex)
+        _add_thermal_noise(received_radar, noise_w)
+        received_radar *= rx_taper[:, np.newaxis]
+
+        directions_local = directions_world @ R_bs_rx
+        theta_local = np.arccos(np.clip(directions_local[:, 2], -1.0, 1.0))
+        phi_local = np.arctan2(directions_local[:, 1], directions_local[:, 0])
+        c_theta, c_phi = scene.rx_array.antenna_pattern.patterns[0](mi.Float(theta_local), mi.Float(phi_local))
+        element_gain = np.array(dr.abs(c_theta) ** 2 + dr.abs(c_phi) ** 2)
+
+        # radar.transmit() above already generated rx_names[0]'s frame, so
+        # __last_transmission is set for Sturm normalization; the other drones' streams are
+        # additive self-interference in received_radar (see module docstring).
+        return _ofdm_radar_cube_from_received(
+            radar, rx_device_state.receive_state(), received_radar, angle_grid, element_gain, bandwidth, carrier_frequency,
+            max_range_m=max_range_m,
+        )
+
+    radar_cubes = [sense(realization, bs_rx, rx_positions[0])]
 
     # ==================== COMMS ====================
     # One decode chain per served drone. Interference needs no explicit term: tx_signal is
@@ -403,7 +433,16 @@ def run_jcas_drop(
             throughput_mbps=throughput_mbps, snr_db=snr_db, precoding_vector=precoding_vector,
         )
 
-    return JCASDropResult(radar_cube=radar_cube, comms=comms)
+    # Remaining sensing receivers, one solve each. The previous solve and the last drone
+    # link are released first, so peak memory stays that of the first solve.
+    sample_drone = channel_drone = received_drone = paths = None
+    for k in range(1, len(rx_positions)):
+        realization = None
+        gc.collect()
+        bs_rx, realization = solve(k)
+        radar_cubes.append(sense(realization, bs_rx, rx_positions[k]))
+
+    return JCASDropResult(radar_cubes=radar_cubes, comms=comms)
 
 
 def _ber_for_log(c):

@@ -362,6 +362,7 @@ class GeometricSionnaChannelRealization(ChannelRealization[GeometricSionnaChanne
         monostatic_min_range_m: float = 3.0,
         path_solver_seed: int = 41,
         samples_per_src: int = 1000000,
+        sensing_rx_names: list[str] | None = None,
     ) -> None:
         ChannelRealization.__init__(self, sample_hooks, gain)
         self._scene = scene
@@ -370,6 +371,7 @@ class GeometricSionnaChannelRealization(ChannelRealization[GeometricSionnaChanne
         self._max_num_paths_per_src = max_num_paths_per_src
         self._monostatic_min_range_m = monostatic_min_range_m
         self._samples_per_src = samples_per_src
+        self._sensing_rx_names = sensing_rx_names
 
         # One solve over every tx/rx already placed in `scene` by the caller.
         #
@@ -420,9 +422,17 @@ class GeometricSionnaChannelRealization(ChannelRealization[GeometricSionnaChanne
         response = GeometricChannelResponse.from_sionna_paths(
             self.paths, state.carrier_frequency, rx_index=rx_index, tx_index=tx_index,
         )
-        # Co-located tx/rx need the self-coupling clutter guard; bistatic links don't.
-        monostatic = np.allclose(self._tx_positions[tx_index], self._rx_positions[rx_index])
-        min_range_m = self._monostatic_min_range_m if monostatic else 0.0
+        # Sensing links drop self-coupling clutter and the direct tx->rx path: anything
+        # shorter than the baseline plus the monostatic guard. Comms links keep every path.
+        # With no sensing receivers named, co-located links are the sensing ones.
+        tx_position = self._tx_positions[tx_index]
+        rx_position = self._rx_positions[rx_index]
+        if self._sensing_rx_names is None:
+            sensing = np.allclose(tx_position, rx_position)
+        else:
+            sensing = self._rx_names[rx_index] in self._sensing_rx_names
+        baseline_m = np.linalg.norm(tx_position - rx_position)
+        min_range_m = self._monostatic_min_range_m + baseline_m / 2 if sensing else 0.0
         return GeometricSionnaChannelSample(response, self.gain, state, min_range_m)
 
     @override
@@ -463,8 +473,9 @@ class GeometricSionnaChannel(Channel[GeometricSionnaChannelRealization, Geometri
         seed: int | None = None,
         max_depth: int = 5,
         max_num_paths_per_src: int = 5000,
-        monostatic_min_range_m: float = 3.0,  # self-coupling clutter guard for co-located tx/rx links
+        monostatic_min_range_m: float = 3.0,  # self-coupling clutter guard for sensing links
         samples_per_src: int = 1000000,       # SBR rays launched per transmitter -- see _realize
+        sensing_rx_names: list[str] | None = None,  # receivers that get the guard; None = co-located ones
     ) -> None:
         Channel.__init__(self, gain, seed)
         self._scene = scene
@@ -473,6 +484,7 @@ class GeometricSionnaChannel(Channel[GeometricSionnaChannelRealization, Geometri
         self._max_num_paths_per_src = max_num_paths_per_src
         self._monostatic_min_range_m = monostatic_min_range_m
         self._samples_per_src = samples_per_src
+        self._sensing_rx_names = sensing_rx_names
 
     @property
     def scene(self) -> Any:
@@ -491,4 +503,5 @@ class GeometricSionnaChannel(Channel[GeometricSionnaChannelRealization, Geometri
             self._monostatic_min_range_m,
             self.seed if self.seed is not None else 41,
             samples_per_src=self._samples_per_src,
+            sensing_rx_names=self._sensing_rx_names,
         )

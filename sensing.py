@@ -158,14 +158,17 @@ class _SensingOFDMRadar:
         return range_bins, cube
 
     def _estimate_range(self, transmitted, line, device):
-        """OFDMRadar.__estimate_range with the division matrix windowed in range and
-        Doppler before the two transforms."""
+        """OFDMRadar.__estimate_range with static clutter subtracted and the division
+        matrix windowed in range and Doppler before the two transforms."""
         received = self.waveform.demodulate(line, device.bandwidth, device.oversampling_factor)
         tx = transmitted.raw
         normalized = np.divide(
             received.raw, tx, np.zeros_like(received.raw), where=np.abs(tx) != 0.0
         )
         d = normalized[0]  # [words, subcarriers]
+        # Static clutter is constant across words: remove it before the Doppler window
+        # spreads it into the bins beside zero Doppler.
+        d = d - d.mean(axis=0, keepdims=True)
         d = d * _doppler_window(d.shape[0])[:, np.newaxis] * _range_window(d.shape[1])[np.newaxis, :]
         return np.abs(ifftshift(fft(ifft(d, axis=1), axis=0), axes=0))
 
@@ -187,6 +190,7 @@ class _SensingOFDMRadar:
             channel = np.divide(
                 rx_ref, tx_ref, np.zeros_like(rx_ref), where=np.abs(tx_ref) != 0.0
             )
+            channel -= channel.mean(axis=0, keepdims=True)  # static clutter, as in _estimate_range
             channel = (channel * _doppler_window(channel.shape[0])[:, np.newaxis]
                                * _range_window(channel.shape[1])[np.newaxis, :])
             # range = IDFT over the comb subcarriers, doppler = DFT over slow-time words
@@ -270,10 +274,10 @@ def _ofdm_radar_cube_from_received(
     n_sym = radar.waveform.words_per_frame
     doppler_bins = -(np.arange(n_sym) - n_sym // 2) * radar.relative_doppler_resolution(bandwidth)
 
-    # Null the zero-velocity clutter band. A static scatterer sits at exactly zero
-    # Doppler, so one bin is the right width; leakage past it is the window's job. The
-    # nulled width is (guard + 0.5) * velocity resolution, and drones slower than that
-    # share the clutter cell and are lost either way.
+    # Null the zero-velocity bin. Static clutter is already subtracted before the Doppler
+    # window (_estimate_range, _estimate_comb); this clears what the window leaves at
+    # zero Doppler. The nulled width is (guard + 0.5) * velocity resolution, and drones
+    # slower than that share the clutter cell and are lost either way.
     zero_doppler_idx = np.argmin(np.abs(doppler_bins))
     lo = max(0, zero_doppler_idx - zero_doppler_guard)
     hi = min(len(doppler_bins), zero_doppler_idx + zero_doppler_guard + 1)
@@ -510,16 +514,23 @@ def sense_snapshot(
     )
 
 
-def ground_truth_range_velocity(bs_position, target_position, target_velocity):
+def ground_truth_range_velocity(bs_position, target_position, target_velocity, rx_position=None):
     """True (range, radial velocity) of a target relative to bs_position -- the two
     quantities a Range-Doppler map's axes represent, so a peak can be checked
     against ground truth. Positive velocity = receding, matching
     RadarCube.velocity_bins.
+
+    rx_position: sensing receiver, default co-located with bs_position. Separated, the
+    pair is half the bistatic range sum and half its rate, which is what the cube measures.
     """
     bs_position = np.asarray(bs_position, dtype=float)
-    delta = np.asarray(target_position, dtype=float) - bs_position
-    rng = np.linalg.norm(delta)
-    radial_velocity = np.dot(np.asarray(target_velocity, dtype=float), delta) / rng
+    rx_position = bs_position if rx_position is None else np.asarray(rx_position, dtype=float)
+    target_velocity = np.asarray(target_velocity, dtype=float)
+    delta_tx = np.asarray(target_position, dtype=float) - bs_position
+    delta_rx = np.asarray(target_position, dtype=float) - rx_position
+    range_tx, range_rx = np.linalg.norm(delta_tx), np.linalg.norm(delta_rx)
+    rng = (range_tx + range_rx) / 2
+    radial_velocity = (np.dot(target_velocity, delta_tx) / range_tx + np.dot(target_velocity, delta_rx) / range_rx) / 2
     return float(rng), float(radial_velocity)
 
 
@@ -540,17 +551,38 @@ def peak_range_velocity(cube, max_range_m=None):
     return float(range_bins[range_idx]), float(cube.velocity_bins[vel_idx])
 
 
-def world_to_spherical(bs_position, target_position):
+def world_to_spherical(bs_position, target_position, rx_position=None):
     """(range_m, azimuth_rad, zenith_rad) of target_position relative to bs_position,
     in the world-frame spherical convention sense_snapshot()'s RX scan uses (azimuth
     from +x in the xy-plane, zenith from +z), so ground truth can be overlaid on a
     range-angle plot.
+
+    rx_position: sensing receiver, default co-located with bs_position. Separated, the
+    angles are seen from the receiver and range is half the bistatic range sum.
     """
-    delta = np.asarray(target_position, dtype=float) - np.asarray(bs_position, dtype=float)
-    rng = np.linalg.norm(delta)
-    zenith = np.arccos(delta[2] / rng)
+    bs_position = np.asarray(bs_position, dtype=float)
+    rx_position = bs_position if rx_position is None else np.asarray(rx_position, dtype=float)
+    target_position = np.asarray(target_position, dtype=float)
+    delta = target_position - rx_position
+    rx_range = np.linalg.norm(delta)
+    rng = (np.linalg.norm(target_position - bs_position) + rx_range) / 2
+    zenith = np.arccos(delta[2] / rx_range)
     azimuth = np.arctan2(delta[1], delta[0])
     return float(rng), float(azimuth), float(zenith)
+
+
+def bistatic_rx_range(half_range_sum, direction, bs_position, rx_position):
+    """Distance from rx_position to a target at `half_range_sum` (a cube range bin) seen
+    along `direction` from the receiver: where that ray meets the range-sum ellipsoid,
+    (L^2 - |b|^2) / (2 (L - u.b)) with L the range sum, u the unit direction and
+    b = tx - rx. Co-located, it is half_range_sum.
+    """
+    b = np.asarray(bs_position, dtype=float) - np.asarray(rx_position, dtype=float)
+    if not b.any():
+        return half_range_sum
+    u = np.asarray(direction, dtype=float) / np.linalg.norm(direction)
+    L = 2 * half_range_sum
+    return float((L ** 2 - b @ b) / (2 * (L - u @ b)))
 
 
 def _local_maxima(cube, hits, n_angle, n_doppler, n_range):
@@ -787,6 +819,7 @@ def score_sensing(
     range_gate_m=8.0,
     azimuth_gate_deg=8.0,
     detect_kwargs=None,
+    rx_position=None,
 ):
     """Score a run of sensing frames against ground truth: detection accuracy (P_d),
     false alarm rate, and position accuracy. Returns a :class:`SensingMetrics`.
@@ -795,6 +828,9 @@ def score_sensing(
     ground_truth_positions: list [T], each a list of that frame's target world
         positions [3], converted to (range, azimuth) via world_to_spherical().
     bs_position: [3] radar world position.
+    rx_position: [3] sensing receiver, default co-located with bs_position. Gating is
+        then on half the bistatic range sum and azimuth at the receiver, the cube's own
+        axes; the position error places each detection on its range-sum ellipsoid.
     detections_per_frame: optional list [T] of already-computed RadarPointCloud. If
         None, detect_targets(cube, **detect_kwargs) runs per frame, so scoring does not
         depend on any plotting having run.
@@ -820,17 +856,23 @@ def score_sensing(
     num_truth = num_detections = num_detected = num_false_alarms = 0
     pos_errs, range_errs, az_errs = [], [], []
 
+    rx_position = bs_position if rx_position is None else rx_position
     for f, cube in enumerate(cubes):
-        truths = [world_to_spherical(bs_position, pos)[:2] for pos in ground_truth_positions[f]]  # (r, az)
+        truths = [world_to_spherical(bs_position, pos, rx_position)[:2] for pos in ground_truth_positions[f]]  # (r, az)
+        truth_rx_ranges = [np.linalg.norm(np.asarray(pos, dtype=float) - np.asarray(rx_position, dtype=float))
+                           for pos in ground_truth_positions[f]]
         dets = detections_per_frame[f] if detections_per_frame is not None else detect_targets(cube, **detect_kwargs)
         det_ra = _detection_range_azimuth(dets)
+        points = dets.points if hasattr(dets, "points") else dets
+        det_rx_ranges = [bistatic_rx_range(r_d, p.position, bs_position, rx_position)
+                         for (r_d, _), p in zip(det_ra, points)]
 
         num_truth += len(truths)
         num_detections += len(det_ra)
 
         det_matched = [False] * len(det_ra)   # fell in some target's gate?
-        for (r_t, az_t) in truths:
-            best = None  # (normalized_dist, r_d, az_d)
+        for i, (r_t, az_t) in enumerate(truths):
+            best = None  # (normalized_dist, r_d, az_d, j)
             for j, (r_d, az_d) in enumerate(det_ra):
                 d_r = r_d - r_t
                 d_az = np.arctan2(np.sin(az_d - az_t), np.cos(az_d - az_t))  # wrapped
@@ -838,13 +880,13 @@ def score_sensing(
                     det_matched[j] = True
                     nd = np.hypot(d_r / range_gate_m, d_az / az_gate)
                     if best is None or nd < best[0]:
-                        best = (nd, r_d, az_d)
+                        best = (nd, r_d, az_d, j)
             if best is not None:
                 num_detected += 1
-                _, r_d, az_d = best
-                # horizontal (x, y) miss distance -- range and cross-range together
-                dx = r_d * np.cos(az_d) - r_t * np.cos(az_t)
-                dy = r_d * np.sin(az_d) - r_t * np.sin(az_t)
+                _, r_d, az_d, j = best
+                # horizontal (x, y) miss distance about the receiver -- range and cross-range together
+                dx = det_rx_ranges[j] * np.cos(az_d) - truth_rx_ranges[i] * np.cos(az_t)
+                dy = det_rx_ranges[j] * np.sin(az_d) - truth_rx_ranges[i] * np.sin(az_t)
                 pos_errs.append(float(np.hypot(dx, dy)))
                 range_errs.append(abs(r_d - r_t))
                 az_errs.append(abs(np.rad2deg(np.arctan2(np.sin(az_d - az_t), np.cos(az_d - az_t)))))
